@@ -9,3 +9,6 @@ pyvenv.cfg
 __pycache__/
 *.pyc
 target/
+nn_weights/
+*.so
+*.so.*
