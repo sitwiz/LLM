@@ -1,4 +1,3 @@
-
 use nalgebra::DVector;
 use crate::pantheon::God;
 use crate::pantheon::khaos::Khaos;
@@ -9,6 +8,7 @@ use crate::ollama::OllamaClient;
 use crate::embedding::{Embedder, DomainEmbeddings};
 use crate::memory::MemorySystem;
 use crate::memory::spatial::ConceptPoint;
+use crate::memory::spatial::personality_phase;
 use crate::soul::manifold::StrobePhase;
 use crate::unified_omni_agi::UnifiedOmniAGI;
 use crate::session::{SessionTracker, SessionContext};
@@ -29,16 +29,32 @@ Three to five sentences maximum.";
 
 const SEMANTIC_THRESHOLD: f64 = 0.4;
 
-/// Map a personality name to a fixed phase angle (radians).
-/// Used for interference‑based retrieval.
-pub fn personality_phase(personality: &str) -> f64 {
-    match personality {
-        "Khaos"    => 0.0,
-        "Gaia"     => std::f64::consts::FRAC_PI_2,   // π/2
-        "Tartaros" => std::f64::consts::FRAC_PI_4,   // π/4
-        "Eros"     => 3.0 * std::f64::consts::FRAC_PI_4, // 3π/4
-        _          => 0.0,
+/// Project a raw 768d domain embedding to a unit vector in 256d soul space.
+/// Uses the same averaging-triplets projection as embed_to_concept.
+/// This gives each personality a semantically meaningful anchor direction
+/// derived from its actual domain description — no hardcoding needed.
+fn domain_anchor(raw_768d: &[f64]) -> DVector<f64> {
+    let mut soul = vec![0.0f64; 256];
+    for (i, chunk) in raw_768d.chunks(3).enumerate() {
+        if i >= 256 { break; }
+        soul[i] = chunk.iter().sum::<f64>() / chunk.len() as f64;
     }
+    let v    = DVector::from_vec(soul);
+    let norm = v.norm().max(1e-10);
+    v / norm
+}
+
+/// Get the domain anchor for a named personality from the domain embeddings.
+fn personality_domain_anchor(domains: &DomainEmbeddings, personality: &str) -> DVector<f64> {
+    let raw = match personality {
+        "Khaos"          => &domains.khaos,
+        "Gaia"           => &domains.gaia,
+        "Tartaros"       => &domains.tartaros,
+        "Eros"           => &domains.eros,
+        "UnifiedOmniAGI" => &domains.omni,
+        _                => &domains.gaia,
+    };
+    domain_anchor(raw)
 }
 
 pub struct QuorumResult {
@@ -208,8 +224,14 @@ impl Quorum {
             }
         }
 
+        // Phase-aware retrieval — use query's dominant domain phase
+        // to suppress cross-domain memories via wave packet interference.
         if !self.memory.spatial.is_empty() {
-            let nearest = self.memory.nearest(&attractor, 3);
+            let top_scores  = self.domains.most_similar(&query_emb);
+            let query_phase = top_scores.first()
+                .map(|(name, _)| personality_phase(name.as_str()))
+                .unwrap_or(std::f64::consts::PI / 2.0);
+            let nearest = self.memory.spatial.nearest_with_phase(&attractor, query_phase, 3);
             if !nearest.is_empty() {
                 println!("Related memories:");
                 for c in &nearest {
@@ -354,7 +376,6 @@ impl Quorum {
             }
         }
 
-        // Brain learns from governance signal
         self.brain.reinforce(query, response_approved);
 
         println!("\n{}", "─".repeat(60));
@@ -381,7 +402,7 @@ impl Quorum {
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_string());
 
-            // Phase‑matched memory display (interference‑based retrieval)
+            // Phase-matched memory display
             let query_phase = personality_phase(&primary);
             let phase_nearest = self.memory.spatial.nearest_with_phase(
                 &attractor,
@@ -389,7 +410,7 @@ impl Quorum {
                 3,
             );
             if !phase_nearest.is_empty() {
-                println!("  [Wave] Phase‑matched memories:");
+                println!("  [Wave] Phase-matched memories:");
                 for c in &phase_nearest {
                     let short_name = if c.name.len() > 50 {
                         format!("{}…", &c.name[..50])
@@ -400,10 +421,6 @@ impl Quorum {
                 }
             }
 
-            // Emergent depth from brain region activation
-            // Replaces hardcoded personality depth assignment
-            // All new concepts start at frontier depth 0.65
-            // Depth is learned over sessions via governance signal (Zeno consolidation)
             let norm = attractor.norm().max(1e-10);
             let initial_depth = 0.65_f64;
             let depth_attractor = crate::soul::hyperbolic::clamp_to_ball(
@@ -418,7 +435,11 @@ impl Quorum {
             );
             self.memory.insert_concept(concept, &depth_attractor, &primary);
 
-            self.memory.spatial.consolidate_depth(query, response_approved);
+            // Consolidate toward the personality's real domain embedding direction.
+            // This keeps Rust memories near the Gaia anchor and consciousness
+            // memories near the Khaos anchor — not collapsed to the same origin.
+            let anchor = personality_domain_anchor(&self.domains, &primary);
+            self.memory.spatial.consolidate_depth(query, response_approved, &anchor);
 
             self.memory.record_exchange(
                 query, &response, &primary, session_context.turn_count,
