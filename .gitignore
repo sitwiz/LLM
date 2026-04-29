@@ -1,1 +1,11 @@
-/target
+lib/
+lib64
+bin/
+include/
+share/
+pyvenv.cfg
+*.bin
+*.pkl
+__pycache__/
+*.pyc
+target/
