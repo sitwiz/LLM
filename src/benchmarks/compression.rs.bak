@@ -1,0 +1,220 @@
+//! Compression benchmark — proves hyperbolic geometry preserves semantic
+//! relationships more faithfully than flat Euclidean space at the same
+//! dimensionality.
+//!
+//! Three conditions compared:
+//!   A — Hyperbolic 256d  (your manifold, geodesic distances)
+//!   B — Euclidean 256d   (same positions, Euclidean distances)
+//!   C — Raw nomic 768d   (cosine distances — ground truth)
+//!
+//! Metric: pairwise distortion ratio — how faithfully each geometry
+//! preserves the true semantic distances from the ground truth.
+//!
+//! If A distortion < B distortion at same dimensionality — compression proven.
+//! If A 256d distortion < C 768d distortion — 3x compression proven.
+
+use nalgebra::DVector;
+use crate::embedding::Embedder;
+use crate::memory::spatial::ConceptPoint;
+use crate::soul::hyperbolic::geodesic_distance;
+use crate::soul::geometry::INITIAL_CURVATURE;
+
+#[derive(Debug, Clone)]
+pub struct ConceptEntry {
+    pub name:        String,
+    pub soul_vec:    DVector<f64>,   // 256d hyperbolic position
+    pub raw_embed:   Vec<f64>,       // 768d nomic embedding (ground truth)
+}
+
+#[derive(Debug)]
+pub struct CompressionResult {
+    pub concept_count:         usize,
+    pub hyperbolic_distortion: f64,  // Condition A
+    pub euclidean_distortion:  f64,  // Condition B
+    pub compression_ratio:     f64,  // B/A — how much better hyperbolic is
+    pub beats_768d:            bool, // whether 256d hyperbolic beats 768d flat
+    pub pair_count:            usize,
+}
+
+impl CompressionResult {
+    pub fn print(&self) {
+        println!("\n[Benchmark] ═══════════════════════════════════════");
+        println!("[Benchmark] Compression Benchmark Results");
+        println!("[Benchmark] Concepts: {}  Pairs: {}", self.concept_count, self.pair_count);
+        println!("[Benchmark] ───────────────────────────────────────");
+        println!("[Benchmark] Hyperbolic 256d distortion: {:.6}", self.hyperbolic_distortion);
+        println!("[Benchmark] Euclidean  256d distortion: {:.6}", self.euclidean_distortion);
+        println!("[Benchmark] Compression ratio (B/A):   {:.3}x", self.compression_ratio);
+        println!("[Benchmark] ───────────────────────────────────────");
+        if self.beats_768d {
+            println!("[Benchmark] ✓ 256d hyperbolic BEATS 768d flat Euclidean");
+            println!("[Benchmark] ✓ 3x compression PROVEN");
+        } else {
+            println!("[Benchmark] ~ 256d hyperbolic does not yet beat 768d flat");
+            println!("[Benchmark] ~ More sessions needed to consolidate manifold");
+        }
+        println!("[Benchmark] ═══════════════════════════════════════\n");
+    }
+}
+
+pub struct CompressionBenchmark {
+    embedder: Embedder,
+}
+
+impl CompressionBenchmark {
+    pub fn new() -> Self {
+        Self { embedder: Embedder::new() }
+    }
+
+    /// Run the full benchmark against all concepts in the spatial index.
+    pub fn run(&self, concepts: &[ConceptPoint]) -> Option<CompressionResult> {
+        if concepts.len() < 3 {
+            println!("[Benchmark] Not enough concepts (need ≥3, have {}). \
+                Run more sessions first.", concepts.len());
+            return None;
+        }
+
+        println!("[Benchmark] Loading raw embeddings for {} concepts...",
+            concepts.len());
+
+        // Build entries — fetch raw 768d embeddings for each concept
+        let mut entries: Vec<ConceptEntry> = Vec::new();
+        for concept in concepts {
+            match self.embedder.embed(&concept.name) {
+                Ok(raw) => {
+                    entries.push(ConceptEntry {
+                        name:      concept.name.clone(),
+                        soul_vec:  concept.position_vec(),
+                        raw_embed: raw,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[Benchmark] Skipping {:?}: {}", concept.name, e);
+                }
+            }
+        }
+
+        if entries.len() < 3 {
+            println!("[Benchmark] Too few valid embeddings. Check Ollama connection.");
+            return None;
+        }
+
+        println!("[Benchmark] Computing pairwise distances for {} concepts...",
+            entries.len());
+
+        let n          = entries.len();
+        let pair_count = n * (n - 1) / 2;
+
+        let mut hyp_distortions: Vec<f64> = Vec::with_capacity(pair_count);
+        let mut euc_distortions: Vec<f64> = Vec::with_capacity(pair_count);
+        let mut raw_beats_count = 0usize;
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let a = &entries[i];
+                let b = &entries[j];
+
+                // Ground truth — cosine distance on 768d nomic embedding
+                let cosine_sim  = cosine_similarity(&a.raw_embed, &b.raw_embed);
+                let ground_truth = (1.0 - cosine_sim).max(1e-10);
+
+                // Condition A — geodesic distance in Poincaré ball (256d)
+                let hyp_dist = geodesic_distance(
+                    &a.soul_vec, &b.soul_vec, INITIAL_CURVATURE
+                ).max(1e-10);
+
+                // Condition B — Euclidean distance on same 256d positions
+                let euc_dist = euclidean_distance(&a.soul_vec, &b.soul_vec)
+                    .max(1e-10);
+
+                // Distortion = |embedded_dist / ground_truth - 1|
+                // Perfect representation = 0.0
+                let hyp_distortion = (hyp_dist / ground_truth - 1.0).abs();
+                let euc_distortion = (euc_dist / ground_truth - 1.0).abs();
+
+                hyp_distortions.push(hyp_distortion);
+                euc_distortions.push(euc_distortion);
+
+                // Does 256d hyperbolic beat 768d flat for this pair?
+                // 768d flat uses Euclidean distance on the raw embeddings
+                let raw_euc = euclidean_distance_raw(&a.raw_embed, &b.raw_embed)
+                    .max(1e-10);
+                let raw_distortion = (raw_euc / ground_truth - 1.0).abs();
+                if hyp_distortion < raw_distortion {
+                    raw_beats_count += 1;
+                }
+            }
+        }
+
+        let hyp_mean = mean(&hyp_distortions);
+        let euc_mean = mean(&euc_distortions);
+        let ratio    = euc_mean / hyp_mean.max(1e-10);
+        let beats_768d = raw_beats_count > pair_count / 2;
+
+        Some(CompressionResult {
+            concept_count:         entries.len(),
+            hyperbolic_distortion: hyp_mean,
+            euclidean_distortion:  euc_mean,
+            compression_ratio:     ratio,
+            beats_768d,
+            pair_count,
+        })
+    }
+
+    /// Save result to disk for tracking across sessions.
+    pub fn save_result(&self, result: &CompressionResult) {
+        let record = serde_json::json!({
+            "timestamp":             unix_now(),
+            "concept_count":         result.concept_count,
+            "hyperbolic_distortion": result.hyperbolic_distortion,
+            "euclidean_distortion":  result.euclidean_distortion,
+            "compression_ratio":     result.compression_ratio,
+            "beats_768d":            result.beats_768d,
+            "pair_count":            result.pair_count,
+        });
+
+        let line = serde_json::to_string(&record).unwrap_or_default();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("compression_benchmark.jsonl")
+        {
+            use std::io::Write;
+            writeln!(file, "{}", line).ok();
+        }
+
+        println!("[Benchmark] Result saved to compression_benchmark.jsonl");
+    }
+}
+
+// ── Math helpers ─────────────────────────────────────────────────────────────
+
+fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+    let dot:    f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    dot / (norm_a * norm_b).max(1e-10)
+}
+
+fn euclidean_distance(a: &DVector<f64>, b: &DVector<f64>) -> f64 {
+    (a - b).norm()
+}
+
+fn euclidean_distance_raw(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter())
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn mean(v: &[f64]) -> f64 {
+    if v.is_empty() { return 0.0; }
+    v.iter().sum::<f64>() / v.len() as f64
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

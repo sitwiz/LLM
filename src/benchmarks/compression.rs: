@@ -1,0 +1,278 @@
+//! Compression benchmark — proves hyperbolic geometry preserves semantic
+//! relationships more faithfully than flat Euclidean space at the same
+//! dimensionality.
+//!
+//! Three conditions compared:
+//!   A — Hyperbolic 256d  (your manifold, geodesic distances)
+//!   B — Euclidean 256d   (same positions, Euclidean distances)
+//!   C — Raw nomic 768d   (cosine distances — ground truth)
+//!
+//! Metric: Spearman rank correlation — does the ordering of pairs by
+//! distance match the ordering by ground truth semantic distance?
+//!
+//! Scale-independent. If A rank correlation > B rank correlation at the
+//! same dimensionality — hyperbolic geometry is doing more work.
+//! If A 256d beats C 768d Euclidean — 3x compression proven.
+
+use nalgebra::DVector;
+use crate::embedding::Embedder;
+use crate::memory::spatial::ConceptPoint;
+use crate::soul::hyperbolic::geodesic_distance;
+use crate::soul::geometry::INITIAL_CURVATURE;
+
+#[derive(Debug, Clone)]
+pub struct ConceptEntry {
+    pub name:      String,
+    pub soul_vec:  DVector<f64>,  // 256d hyperbolic position
+    pub raw_embed: Vec<f64>,      // 768d nomic embedding (ground truth)
+}
+
+#[derive(Debug)]
+pub struct CompressionResult {
+    pub concept_count:      usize,
+    pub pair_count:         usize,
+    pub hyp_rank_corr:      f64,  // Spearman rho — hyperbolic 256d vs ground truth
+    pub euc_rank_corr:      f64,  // Spearman rho — Euclidean 256d vs ground truth
+    pub euc_768_rank_corr:  f64,  // Spearman rho — Euclidean 768d vs ground truth
+    pub hyp_beats_euc_256:  bool, // A > B — hyperbolic better than same-dim Euclidean
+    pub hyp_beats_euc_768:  bool, // A > C — 256d hyperbolic beats 768d flat
+    pub compression_factor: f64,  // how many times better hyperbolic is than Euclidean 256d
+}
+
+impl CompressionResult {
+    pub fn print(&self) {
+        println!("\n[Benchmark] ═══════════════════════════════════════");
+        println!("[Benchmark] Compression Benchmark — Spearman Rank Correlation");
+        println!("[Benchmark] Concepts: {}  Pairs: {}", self.concept_count, self.pair_count);
+        println!("[Benchmark] ───────────────────────────────────────");
+        println!("[Benchmark] Hyperbolic 256d rank corr: {:.4}  (your system)",
+            self.hyp_rank_corr);
+        println!("[Benchmark] Euclidean  256d rank corr: {:.4}  (flat baseline, same dims)",
+            self.euc_rank_corr);
+        println!("[Benchmark] Euclidean  768d rank corr: {:.4}  (flat baseline, full dims)",
+            self.euc_768_rank_corr);
+        println!("[Benchmark] ───────────────────────────────────────");
+
+        if self.hyp_beats_euc_256 {
+            println!("[Benchmark] ✓ Hyperbolic 256d BEATS Euclidean 256d (ratio {:.3}x)",
+                self.compression_factor);
+            println!("[Benchmark] ✓ Geometry is doing real work — not just dimensionality");
+        } else {
+            println!("[Benchmark] ~ Hyperbolic 256d does not yet beat Euclidean 256d");
+            println!("[Benchmark] ~ Manifold needs more sessions to consolidate");
+        }
+
+        if self.hyp_beats_euc_768 {
+            println!("[Benchmark] ✓ Hyperbolic 256d BEATS Euclidean 768d");
+            println!("[Benchmark] ✓ 3x compression PROVEN — same fidelity, 3x fewer dims");
+        } else {
+            println!("[Benchmark] ~ Hyperbolic 256d does not yet beat Euclidean 768d");
+            println!("[Benchmark] ~ Gap: {:.4}", self.euc_768_rank_corr - self.hyp_rank_corr);
+        }
+
+        println!("[Benchmark] ═══════════════════════════════════════\n");
+    }
+}
+
+pub struct CompressionBenchmark {
+    embedder: Embedder,
+}
+
+impl CompressionBenchmark {
+    pub fn new() -> Self {
+        Self { embedder: Embedder::new() }
+    }
+
+    pub fn run(&self, concepts: &[ConceptPoint]) -> Option<CompressionResult> {
+        if concepts.len() < 3 {
+            println!("[Benchmark] Not enough concepts (need ≥3, have {}). \
+                Run more sessions first.", concepts.len());
+            return None;
+        }
+
+        println!("[Benchmark] Loading raw embeddings for {} concepts...",
+            concepts.len());
+
+        let mut entries: Vec<ConceptEntry> = Vec::new();
+        for concept in concepts {
+            // Skip concepts with very long names — they are reflection artifacts
+            if concept.name.len() > 120 { continue; }
+
+            match self.embedder.embed(&concept.name) {
+                Ok(raw) => {
+                    entries.push(ConceptEntry {
+                        name:      concept.name.clone(),
+                        soul_vec:  concept.position_vec(),
+                        raw_embed: raw,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[Benchmark] Skipping {:?}: {}", &concept.name[..40.min(concept.name.len())], e);
+                }
+            }
+        }
+
+        if entries.len() < 3 {
+            println!("[Benchmark] Too few valid embeddings.");
+            return None;
+        }
+
+        println!("[Benchmark] Computing pairwise distances for {} concepts...",
+            entries.len());
+
+        let n          = entries.len();
+        let pair_count = n * (n - 1) / 2;
+
+        let mut ground_truth_dists: Vec<f64> = Vec::with_capacity(pair_count);
+        let mut hyp_dists:          Vec<f64> = Vec::with_capacity(pair_count);
+        let mut euc_256_dists:      Vec<f64> = Vec::with_capacity(pair_count);
+        let mut euc_768_dists:      Vec<f64> = Vec::with_capacity(pair_count);
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let a = &entries[i];
+                let b = &entries[j];
+
+                // Ground truth — cosine distance on 768d nomic embeddings
+                let cosine_sim   = cosine_similarity(&a.raw_embed, &b.raw_embed);
+                let ground_truth = 1.0 - cosine_sim;
+                ground_truth_dists.push(ground_truth);
+
+                // Condition A — geodesic distance in Poincaré ball 256d
+                let hyp_dist = geodesic_distance(
+                    &a.soul_vec, &b.soul_vec, INITIAL_CURVATURE
+                );
+                hyp_dists.push(hyp_dist);
+
+                // Condition B — Euclidean distance on same 256d soul positions
+                let euc_256 = (&a.soul_vec - &b.soul_vec).norm();
+                euc_256_dists.push(euc_256);
+
+                // Condition C — Euclidean distance on full 768d raw embeddings
+                let euc_768 = euclidean_distance_raw(&a.raw_embed, &b.raw_embed);
+                euc_768_dists.push(euc_768);
+            }
+        }
+
+        // Compute Spearman rank correlations against ground truth
+        let hyp_rank_corr     = spearman_rho(&ground_truth_dists, &hyp_dists);
+        let euc_256_rank_corr = spearman_rho(&ground_truth_dists, &euc_256_dists);
+        let euc_768_rank_corr = spearman_rho(&ground_truth_dists, &euc_768_dists);
+
+        let hyp_beats_euc_256  = hyp_rank_corr > euc_256_rank_corr;
+        let hyp_beats_euc_768  = hyp_rank_corr > euc_768_rank_corr;
+        let compression_factor = if euc_256_rank_corr > 0.0 {
+            hyp_rank_corr / euc_256_rank_corr
+        } else {
+            1.0
+        };
+
+        Some(CompressionResult {
+            concept_count: entries.len(),
+            pair_count,
+            hyp_rank_corr,
+            euc_rank_corr: euc_256_rank_corr,
+            euc_768_rank_corr,
+            hyp_beats_euc_256,
+            hyp_beats_euc_768,
+            compression_factor,
+        })
+    }
+
+    pub fn save_result(&self, result: &CompressionResult) {
+        let record = serde_json::json!({
+            "timestamp":          unix_now(),
+            "concept_count":      result.concept_count,
+            "pair_count":         result.pair_count,
+            "hyp_rank_corr":      result.hyp_rank_corr,
+            "euc_rank_corr":      result.euc_rank_corr,
+            "euc_768_rank_corr":  result.euc_768_rank_corr,
+            "hyp_beats_euc_256":  result.hyp_beats_euc_256,
+            "hyp_beats_euc_768":  result.hyp_beats_euc_768,
+            "compression_factor": result.compression_factor,
+        });
+
+        let line = serde_json::to_string(&record).unwrap_or_default();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("compression_benchmark.jsonl")
+        {
+            use std::io::Write;
+            writeln!(file, "{}", line).ok();
+        }
+
+        println!("[Benchmark] Result saved to compression_benchmark.jsonl");
+    }
+}
+
+// ── Math helpers ─────────────────────────────────────────────────────────────
+
+fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+    let dot:    f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    dot / (norm_a * norm_b).max(1e-10)
+}
+
+fn euclidean_distance_raw(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter())
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Spearman rank correlation between two distance vectors.
+/// Measures whether the ordering of pairs matches — scale independent.
+/// Returns value in [-1, 1]. Higher = better rank preservation.
+fn spearman_rho(x: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(x.len(), y.len());
+    let n = x.len();
+    if n < 2 { return 0.0; }
+
+    let rank_x = ranks(x);
+    let rank_y = ranks(y);
+
+    // Pearson correlation on ranks
+    let mean_x = rank_x.iter().sum::<f64>() / n as f64;
+    let mean_y = rank_y.iter().sum::<f64>() / n as f64;
+
+    let num: f64 = rank_x.iter().zip(rank_y.iter())
+        .map(|(rx, ry)| (rx - mean_x) * (ry - mean_y))
+        .sum();
+
+    let den_x: f64 = rank_x.iter().map(|rx| (rx - mean_x).powi(2)).sum::<f64>().sqrt();
+    let den_y: f64 = rank_y.iter().map(|ry| (ry - mean_y).powi(2)).sum::<f64>().sqrt();
+
+    num / (den_x * den_y).max(1e-10)
+}
+
+/// Compute ranks of a vector — ties get average rank.
+fn ranks(v: &[f64]) -> Vec<f64> {
+    let n = v.len();
+    let mut indexed: Vec<(usize, f64)> = v.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    let mut result = vec![0.0f64; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && (indexed[j].1 - indexed[i].1).abs() < 1e-10 {
+            j += 1;
+        }
+        // Average rank for tied values
+        let avg_rank = (i + j - 1) as f64 / 2.0 + 1.0;
+        for k in i..j {
+            result[indexed[k].0] = avg_rank;
+        }
+        i = j;
+    }
+    result
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

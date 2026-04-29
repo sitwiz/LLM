@@ -1,0 +1,170 @@
+//! Soul geometry — hyperbolic version
+//! Replaces unit-sphere normalisation with Poincaré ball projection.
+//! compute_nf replaced by norm (‖x‖ = depth in ball).
+
+use nalgebra::DVector;
+use crate::soul::hyperbolic::{clamp_to_ball, sphere_to_ball, geodesic_distance, exp_map, log_map};
+
+pub const SOUL_DIM:       usize = 256;
+pub const PHI:            f64   = 1.6180339887498948482;
+pub const GOLDEN_RATIO:   f64   = PHI;
+pub const INITIAL_CURVATURE: f64 = 1.0;
+pub const MAX_SAFE_NORM:  f64   = 0.9999;  // stay away from boundary for numerical stability
+
+/// Project a raw embedding vector into the Poincaré ball.
+/// Used for initialisation from nomic embeddings (which may have any norm).
+pub fn project_to_ball(x: &DVector<f64>) -> DVector<f64> {
+    let norm = x.norm();
+    if norm < 1e-10 {
+        return DVector::zeros(x.len());
+    }
+    // Scale via tanh so the result is in (0, 1)
+    // tanh maps [0, ∞) to [0, 1) — naturally bounded
+    let scale = (norm * 0.5).tanh() / norm;
+    clamp_to_ball(&(x * scale), MAX_SAFE_NORM)
+}
+
+/// Convert an existing unit-sphere soul to the Poincaré ball.
+pub fn normalise_to_ball(x: &DVector<f64>) -> DVector<f64> {
+    sphere_to_ball(x, MAX_SAFE_NORM)
+}
+
+/// Legacy: normalise to unit sphere (kept for compatibility during transition).
+/// DEPRECATED: Do not use in new hyperbolic code.
+#[deprecated(note = "Hyperbolic souls must not be forced to unit norm")]
+pub fn normalise(x: &DVector<f64>) -> DVector<f64> {
+    let norm = x.norm();
+    if norm < 1e-10 {
+        return x.clone();
+    }
+    x / norm
+}
+
+/// Coherence measure in the Poincaré ball.
+/// NF = ‖x‖ — the norm of the soul position.
+/// Near 0 = incoherent (origin), approaching 1 = deep understanding (boundary).
+/// This replaces the entropy-based NF from the spherical model.
+pub fn compute_nf(x: &DVector<f64>) -> f64 {
+    x.norm()
+}
+
+/// Update soul toward a new position using hyperbolic geodesic interpolation.
+/// Momentum = 1/PHI ≈ 0.618 (golden ratio conjugate).
+pub fn update_soul(
+    current: &DVector<f64>,
+    target:  &DVector<f64>,
+) -> DVector<f64> {
+    let momentum = 1.0 / PHI; // 0.618
+    let lr       = 1.0 - momentum;
+    let v        = log_map(current, target, INITIAL_CURVATURE);
+    let updated  = exp_map(current, &(v * lr), INITIAL_CURVATURE);
+    clamp_to_ball(&updated, MAX_SAFE_NORM)
+}
+
+/// Initialise a soul from a domain text embedding.
+/// The embedding comes from nomic-embed-text (768d) projected to 256d.
+/// We then project from that 256d space into the Poincaré ball.
+pub fn soul_from_embedding(embedding: &[f64]) -> DVector<f64> {
+    assert!(embedding.len() >= SOUL_DIM,
+        "Embedding too short: {} < {}", embedding.len(), SOUL_DIM);
+    let v = DVector::from_vec(embedding[..SOUL_DIM].to_vec());
+    project_to_ball(&v)
+}
+
+/// Compute the current curvature given the number of learning epochs.
+/// Curvature decreases (space flattens) as the system learns.
+/// c(t) = max(MIN_CURVATURE, INITIAL_CURVATURE / (1 + epoch * decay_rate))
+pub fn curvature_at_epoch(epoch: u32) -> f64 {
+    let decay_rate = 0.01;
+    let c = INITIAL_CURVATURE / (1.0 + epoch as f64 * decay_rate);
+    c.max(crate::soul::manifold::MIN_CURVATURE)
+}
+
+/// Check if a soul position is in the forbidden zone.
+/// Forbidden: too close to origin (incoherent) or too close to boundary (unstable).
+pub fn in_forbidden_zone(x: &DVector<f64>) -> bool {
+    let norm = x.norm();
+    norm < 0.05 || norm > 0.98
+}
+
+/// Compute geodesic distance between two soul positions.
+/// Wraps hyperbolic::geodesic_distance with default curvature.
+pub fn soul_distance(x: &DVector<f64>, y: &DVector<f64>) -> f64 {
+    geodesic_distance(x, y, INITIAL_CURVATURE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rand_vec(seed: f64) -> DVector<f64> {
+        let v: Vec<f64> = (0..SOUL_DIM)
+            .map(|i| ((i as f64 + seed) * 1.7).sin())
+            .collect();
+        DVector::from_vec(v)
+    }
+
+    #[test]
+    fn test_project_to_ball_in_range() {
+        let x = rand_vec(1.0);
+        let b = project_to_ball(&x);
+        assert!(b.norm() < MAX_SAFE_NORM, "Should be inside ball, norm={}", b.norm());
+        assert!(b.norm() > 0.0, "Should be nonzero");
+    }
+
+    #[test]
+    fn test_compute_nf_is_norm() {
+        let x = project_to_ball(&rand_vec(2.0));
+        let nf = compute_nf(&x);
+        assert!((nf - x.norm()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_update_soul_moves_toward_target() {
+        let current = project_to_ball(&rand_vec(1.0));
+        let target  = project_to_ball(&rand_vec(2.0));
+        let updated = update_soul(&current, &target);
+        let d_before = soul_distance(&current, &target);
+        let d_after  = soul_distance(&updated, &target);
+        assert!(d_after < d_before,
+            "Soul should move toward target: {} -> {}", d_before, d_after);
+    }
+
+    #[test]
+    fn test_update_soul_stays_in_ball() {
+        let current = project_to_ball(&rand_vec(1.0));
+        let target  = project_to_ball(&rand_vec(5.0));
+        let updated = update_soul(&current, &target);
+        assert!(updated.norm() < MAX_SAFE_NORM, "Updated soul should stay in ball");
+    }
+
+    #[test]
+    fn test_forbidden_zone_origin() {
+        let near_origin = DVector::zeros(SOUL_DIM);
+        assert!(in_forbidden_zone(&near_origin));
+    }
+
+    #[test]
+    fn test_not_forbidden_zone_mid() {
+        let mut x = DVector::zeros(SOUL_DIM);
+        x[0] = 0.5;
+        assert!(!in_forbidden_zone(&x));
+    }
+
+    #[test]
+    fn test_curvature_decays() {
+        let c0  = curvature_at_epoch(0);
+        let c10 = curvature_at_epoch(10);
+        let c100 = curvature_at_epoch(100);
+        assert!(c0 >= c10, "Curvature should decay");
+        assert!(c10 >= c100, "Curvature should decay further");
+        assert!(c100 >= crate::soul::manifold::MIN_CURVATURE, "Should not go below min");
+    }
+
+    #[test]
+    fn test_soul_from_embedding() {
+        let emb: Vec<f64> = (0..SOUL_DIM).map(|i| (i as f64).sin()).collect();
+        let soul = soul_from_embedding(&emb);
+        assert!(soul.norm() < MAX_SAFE_NORM, "Soul from embedding should be in ball");
+    }
+}
