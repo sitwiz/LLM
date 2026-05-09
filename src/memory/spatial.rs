@@ -124,21 +124,25 @@ impl ConceptPoint {
     /// Concepts drift toward their personality's semantic region of the ball,
     /// not toward the shared origin — keeping domains separated after consolidation.
     pub fn update_depth(&mut self, approved: bool, anchor: &DVector<f64>) {
-        if approved {
-            self.target_depth = (self.target_depth * 0.97).max(0.05);
-            self.sigma        = (self.sigma * 0.95).max(SIGMA_MIN);
-        } else {
-            self.target_depth = (self.target_depth * 1.02).min(0.85);
-            self.sigma        = (self.sigma * 1.02).min(SIGMA_MAX);
-        }
+        // Precision weighting — high-certainty memories resist updating.
+        // precision = 1/σ² — normalised to 0..1 range using SIGMA_MAX.
+        // Low sigma (consolidated) → small update_rate → barely moves.
+        // High sigma (frontier)    → large update_rate → updates freely.
+        let update_rate = (self.sigma / SIGMA_MAX).min(1.0);
 
+        if approved {
+            self.target_depth = (self.target_depth * (1.0 - 0.03 * update_rate)).max(0.05);
+            self.sigma        = (self.sigma * (1.0 - 0.05 * update_rate)).max(SIGMA_MIN);
+        } else {
+            self.target_depth = (self.target_depth * (1.0 + 0.02 * update_rate)).min(0.85);
+            self.sigma        = (self.sigma * (1.0 + 0.02 * update_rate)).min(SIGMA_MAX);
+        }
         let new_pos = anchor * self.target_depth;
         self.position = new_pos.iter().cloned().collect();
         self.norm     = self.target_depth;
         self.zone     = MemoryZone::from_norm(self.norm);
-    }
+   }
 }
-
 pub struct SpatialIndex {
     pub concepts:    Vec<ConceptPoint>,
     pub soul_radius: f64,

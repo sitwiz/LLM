@@ -247,6 +247,26 @@ pub fn dream_cycle(
     ];
     rebalance(&mut souls);
 
+    // Call npcpy sleep/pruning on the knowledge graph
+    println!("[Dream] Calling KG sleep cycle...");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build();
+    if let Ok(client) = client {
+        match client.post("http://localhost:5001/sleep")
+            .json(&serde_json::json!({"model": "phi3:mini", "provider": "ollama"}))
+            .send() {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    println!("[Dream] KG sleep complete.");
+                } else {
+                    println!("[Dream] KG sleep returned: {}", resp.status());
+                }
+            }
+            Err(e) => println!("[Dream] KG sleep failed: {}", e),
+        }
+    }
+
     let paths = [
         "khaos_soul.bin",
         "gaia_soul.bin",

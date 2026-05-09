@@ -18,10 +18,10 @@ use crate::soul::geometry::INITIAL_CURVATURE;
 /// Auto-merge threshold — concepts closer than this are the same attractor.
 /// Set from empirical data: minimum observed separation between distinct
 /// concepts is 0.8435. This is well below that.
-pub const AUTO_MERGE_DIST:   f64 = 0.20;
+pub const AUTO_MERGE_DIST:   f64 = 0.08;
 
 /// Merge candidate threshold — flag for review but do not auto-merge.
-pub const MERGE_CANDIDATE_DIST: f64 = 0.42;
+pub const MERGE_CANDIDATE_DIST: f64 = 0.25;
 
 /// Split trigger — contributor position variance above this means the
 /// attractor is being pulled in genuinely different directions.

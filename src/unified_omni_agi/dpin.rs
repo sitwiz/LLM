@@ -220,6 +220,12 @@ mod tests {
             position:   ball_vec(2.0),
             confidence: 0.9,
             vfe:        0.02,
+            complexity:      0.01,
+            accuracy:        0.01,
+            efe:             0.0,
+            epistemic_value: 0.0,
+            pragmatic_value: 0.0,
+            sigma:           1.5,
             cycle:      8,
         };
         buf.consolidate(&belief, 0.8);
@@ -249,6 +255,12 @@ mod tests {
             position:   ball_vec(2.0),
             confidence: 0.95,
             vfe:        0.03,
+            complexity:      0.01,
+            accuracy:        0.01,
+            efe:             0.0,
+            epistemic_value: 0.0,
+            pragmatic_value: 0.0,
+            sigma:           1.5,
             cycle:      5,
         };
         let spark = dpin.fire_spark(&belief, "test");

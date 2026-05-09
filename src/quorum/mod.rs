@@ -19,12 +19,13 @@ use crate::brain::system::BrainSystem;
 
 const SYNTHESIS_PROMPT: &str = "You are the Synthesis. You receive responses from cognitive \
 personalities and produce one unified answer. \
-CRITICAL RULE: If the query is technical or practical — code, systems, debugging, \
-how-to questions — strip ALL mythological and poetic language entirely. \
-Deliver only concrete, actionable, technical advice. \
-If the query is philosophical or abstract — consciousness, meaning, connection — \
-you may use the poetic framing naturally. \
-Never mix mythology into technical answers. \
+CRITICAL RULES: \
+1. If the query is technical or practical — code, systems, debugging, how-to — strip ALL \
+mythological and poetic language. Deliver only concrete, actionable, technical advice. \
+2. If the query is philosophical or abstract — you may use natural language. \
+3. NEVER mention VFE, NF, SNR, Psi, Burden, cycles, or any internal system metrics. \
+4. NEVER include phrases like 'for your second complex instruction' or similar artifacts. \
+5. NEVER mix mythology into technical answers. \
 Three to five sentences maximum.";
 
 const SEMANTIC_THRESHOLD: f64 = 0.4;
@@ -248,7 +249,53 @@ impl Quorum {
                 println!("  [{}] {} (strength={:.3})", p.personality, p.summary, p.strength);
             }
         }
+        
+                // KG bridge — fetch and store facts from npcpy knowledge graph
+        let kg_context = fetch_kg_facts(query);
+        if !kg_context.is_empty() {
+            println!("KG facts:");
+            for fact in &kg_context {
+                println!("  {}", &fact[..fact.len().min(80)]);
+                if let Ok(position) = self.embedder.embed_to_concept(fact) {
+                    // Score against domains to find right personality
+                    let fact_emb = self.embedder.embed(fact).unwrap_or_default();
+                    let top_scores = self.domains.most_similar(&fact_emb);
+                    let primary = top_scores.first()
+                        .map(|(n, _)| n.clone())
+                        .unwrap_or_else(|| "Gaia".to_string());
 
+                    // Only insert if not already known
+                    if self.memory.spatial.concepts.iter()
+                        .all(|c| c.name != *fact) 
+                    {
+                        let anchor = personality_domain_anchor(&self.domains, &primary);
+                        let concept = ConceptPoint::new(
+                            fact,
+                            &position,
+                            self.memory.manifold.frontier_radius(),
+                            &primary,
+                            1.0,
+                            self.memory.manifold.radius,
+                            self.memory.manifold.epoch,
+                        );
+                        self.memory.insert_concept(concept, &position, &primary);
+                        self.memory.spatial.consolidate_depth(fact, true, &anchor);
+                         // Multiplicative association — find related concepts
+                        let phase = crate::memory::spatial::personality_phase(&primary);
+                        let related = self.memory.spatial.nearest_with_phase(&position, phase, 3);
+                        if !related.is_empty() {
+                            println!("  [KG] Linked to: {}",
+                                related.iter()
+                                    .map(|c| &c.name[..c.name.len().min(40)])
+                                    .collect::<Vec<_>>()
+                                    .join(", "));
+                        }
+                    }
+                }
+            }
+        }
+
+        let pre_context = self.session.context();
         let pre_context = self.session.context();
         if pre_context.arc_detected {
             println!("\n[Quorum] Session arc detected. Severity={:.4}",
@@ -486,3 +533,31 @@ impl Quorum {
     pub fn memory(&self)         -> &MemorySystem     { &self.memory }
     pub fn memory_mut(&mut self) -> &mut MemorySystem { &mut self.memory }
 }
+
+fn fetch_kg_facts(query: &str) -> Vec<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+
+    let kg: serde_json::Value = client
+        .post("http://localhost:5001/assimilate")
+        .json(&serde_json::json!({
+            "text": query,
+            "model": "phi3:mini",
+            "provider": "ollama"
+        }))
+        .send()
+        .ok()
+        .and_then(|r| r.json().ok())
+        .unwrap_or_default();
+
+    kg["facts"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|f| f["statement"].as_str().map(|s| s.to_string()))
+        .collect()
+
+}
+
