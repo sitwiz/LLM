@@ -12,3 +12,4 @@ target/
 nn_weights/
 *.so
 *.so.*
+npcpy/
