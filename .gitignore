@@ -13,3 +13,4 @@ nn_weights/
 *.so
 *.so.*
 npcpy/
+nn_weights/
