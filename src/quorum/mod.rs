@@ -7,8 +7,7 @@ use crate::pantheon::eros::Eros;
 use crate::ollama::OllamaClient;
 use crate::embedding::{Embedder, DomainEmbeddings};
 use crate::memory::MemorySystem;
-use crate::memory::spatial::ConceptPoint;
-use crate::memory::spatial::personality_phase;
+use crate::memory::spatial::{ConceptPoint, personality_phase, uor_address};
 use crate::soul::manifold::StrobePhase;
 use crate::unified_omni_agi::UnifiedOmniAGI;
 use crate::session::{SessionTracker, SessionContext};
@@ -17,23 +16,25 @@ use crate::neo_cortical_mesh::quorum::NeoCorticalMesh;
 use crate::soul::geometry::curvature_at_epoch;
 use crate::brain::system::BrainSystem;
 
-const SYNTHESIS_PROMPT: &str = "You are the Synthesis. You receive responses from cognitive \
-personalities and produce one unified answer. \
+fn synthesis_prompt(active_names: &[String]) -> String {
+    let names = active_names.join(", ");
+    format!(
+        "You are the Synthesis. The ONLY active personalities are: {}. \
+Combine their responses into one unified answer. \
 CRITICAL RULES: \
-1. If the query is technical or practical — code, systems, debugging, how-to — strip ALL \
-mythological and poetic language. Deliver only concrete, actionable, technical advice. \
-2. If the query is philosophical or abstract — you may use natural language. \
-3. NEVER mention VFE, NF, SNR, Psi, Burden, cycles, or any internal system metrics. \
-4. NEVER include phrases like 'for your second complex instruction' or similar artifacts. \
-5. NEVER mix mythology into technical answers. \
-Three to five sentences maximum.";
+1. Technical queries — strip ALL mythological language. Concrete advice only. \
+2. Philosophical queries — natural language permitted. \
+3. NEVER mention VFE, NF, SNR, Psi, Burden, cycles, or internal metrics. \
+4. NEVER invent new characters, entities, or personalities beyond those listed above. \
+5. NEVER append additional questions or new content after your response. \
+6. NEVER use any name not in the list above. \
+Stop after three to five sentences.",
+        names
+    )
+}
 
 const SEMANTIC_THRESHOLD: f64 = 0.4;
 
-/// Project a raw 768d domain embedding to a unit vector in 256d soul space.
-/// Uses the same averaging-triplets projection as embed_to_concept.
-/// This gives each personality a semantically meaningful anchor direction
-/// derived from its actual domain description — no hardcoding needed.
 fn domain_anchor(raw_768d: &[f64]) -> DVector<f64> {
     let mut soul = vec![0.0f64; 256];
     for (i, chunk) in raw_768d.chunks(3).enumerate() {
@@ -45,7 +46,6 @@ fn domain_anchor(raw_768d: &[f64]) -> DVector<f64> {
     v / norm
 }
 
-/// Get the domain anchor for a named personality from the domain embeddings.
 fn personality_domain_anchor(domains: &DomainEmbeddings, personality: &str) -> DVector<f64> {
     let raw = match personality {
         "Khaos"          => &domains.khaos,
@@ -58,13 +58,61 @@ fn personality_domain_anchor(domains: &DomainEmbeddings, personality: &str) -> D
     domain_anchor(raw)
 }
 
+// ── Provenance ────────────────────────────────────────────────────────────────
+//
+// Every output the system produces carries a complete, verifiable chain:
+//   query identity → memory concepts that influenced it
+//   → agents that activated → governance decision → response identity
+//
+// UOR addresses are content-derived — same content always produces the same
+// address on any system, making every output externally verifiable.
+
+pub struct Provenance {
+    /// UOR address of the query that triggered this result
+    pub query_uor:           String,
+    /// UOR addresses of memory concepts retrieved during processing
+    pub memory_concepts:     Vec<(String, String)>, // (concept_name, uor_address)
+    /// Agents that activated on this query
+    pub activated_agents:    Vec<String>,
+    /// Whether the governance mesh approved the response
+    pub governance_approved: bool,
+    /// UOR address of the final response
+    pub response_uor:        String,
+}
+
+impl Provenance {
+    fn new(query: &str) -> Self {
+        Self {
+            query_uor:           uor_address(query),
+            memory_concepts:     Vec::new(),
+            activated_agents:    Vec::new(),
+            governance_approved: true,
+            response_uor:        String::new(),
+        }
+    }
+
+    fn add_memory_concept(&mut self, name: &str) {
+        let addr = uor_address(name);
+        if !self.memory_concepts.iter().any(|(n, _)| n == name) {
+            self.memory_concepts.push((name.to_string(), addr));
+        }
+    }
+
+    fn finalise(&mut self, response: &str, approved: bool, agents: Vec<String>) {
+        self.response_uor        = uor_address(response);
+        self.governance_approved = approved;
+        self.activated_agents    = agents;
+    }
+}
+
 pub struct QuorumResult {
-    pub query:     String,
-    pub source:    String,
-    pub response:  String,
-    pub activated: Vec<String>,
-    pub phase:     String,
-    pub session:   SessionContext,
+    pub query:      String,
+    pub source:     String,
+    pub response:   String,
+    pub activated:  Vec<String>,
+    pub phase:      String,
+    pub session:    SessionContext,
+    pub provenance: Provenance,
 }
 
 pub struct Quorum {
@@ -172,12 +220,15 @@ impl Quorum {
         q
     }
 
-    pub fn reflect_silent(&mut self, response: &str) {
+    pub fn reflect_silent(&mut self, response: &str, influence: f64) {
         use crate::unified_omni_agi::vfe::minimise_vfe;
-        use crate::soul::geometry::update_soul;
+        use crate::soul::geometry::{update_soul, INITIAL_CURVATURE};
+        use crate::soul::hyperbolic::{log_map, exp_map};
 
         let obs = self.embedder.embed_to_soul(response)
             .unwrap_or_else(|_| DVector::zeros(256));
+
+        let soul_before = self.omni.soul().clone();
 
         let (belief, _) = minimise_vfe(
             self.omni.soul(),
@@ -186,11 +237,13 @@ impl Quorum {
             0.15,
         );
 
-        *self.omni.soul_mut() = update_soul(self.omni.soul(), &belief.position);
-        *self.khaos.soul_mut() = update_soul(self.khaos.soul(), &belief.position);
+        let soul_after = update_soul(self.omni.soul(), &belief.position);
 
+        let v = log_map(&soul_before, &soul_after, INITIAL_CURVATURE);
+        let preserved = exp_map(&soul_before, &(&v * influence), INITIAL_CURVATURE);
+
+        *self.omni.soul_mut() = preserved;
         self.omni.save();
-        self.khaos.save();
     }
 
     pub fn ask(&mut self, query: &str) -> QuorumResult {
@@ -198,16 +251,21 @@ impl Quorum {
         println!("Query: {}", query);
         println!("{}", "=".repeat(60));
 
+        // Initialise provenance — query identity established at entry point
+        let mut provenance = Provenance::new(query);
+
         if let Some(cached) = self.memory.fast_lookup(query) {
             println!("  [Memory] Exact cache hit — skipping pantheon activation.");
             let session_context = self.session.context();
+            provenance.finalise(&cached, true, Vec::new());
             return QuorumResult {
-                query:     query.to_string(),
-                source:    "cache".to_string(),
-                response:  cached,
-                activated: Vec::new(),
-                phase:     "cache".to_string(),
-                session:   session_context,
+                query:      query.to_string(),
+                source:     "cache".to_string(),
+                response:   cached,
+                activated:  Vec::new(),
+                phase:      "cache".to_string(),
+                session:    session_context,
+                provenance,
             };
         }
 
@@ -215,7 +273,6 @@ impl Quorum {
         let attractor = self.embedder.embed_to_concept(query)
             .unwrap_or_else(|_| DVector::zeros(256));
 
-        // Brain processes query — produces emergent depth from region activation
         let (_, emergent_depth) = self.brain.process_query(query);
 
         if !self.memory.sensory.is_empty() {
@@ -225,8 +282,6 @@ impl Quorum {
             }
         }
 
-        // Phase-aware retrieval — use query's dominant domain phase
-        // to suppress cross-domain memories via wave packet interference.
         if !self.memory.spatial.is_empty() {
             let top_scores  = self.domains.most_similar(&query_emb);
             let query_phase = top_scores.first()
@@ -238,6 +293,8 @@ impl Quorum {
                 for c in &nearest {
                     println!("  {:?} (zone={} visits={} strength={:.3})",
                         c.name, c.zone.label(), c.visit_count, c.strength);
+                    // Record memory concept in provenance chain
+                    provenance.add_memory_concept(&c.name);
                 }
             }
         }
@@ -249,24 +306,21 @@ impl Quorum {
                 println!("  [{}] {} (strength={:.3})", p.personality, p.summary, p.strength);
             }
         }
-        
-                // KG bridge — fetch and store facts from npcpy knowledge graph
+
         let kg_context = fetch_kg_facts(query);
         if !kg_context.is_empty() {
             println!("KG facts:");
             for fact in &kg_context {
                 println!("  {}", &fact[..fact.len().min(80)]);
                 if let Ok(position) = self.embedder.embed_to_concept(fact) {
-                    // Score against domains to find right personality
                     let fact_emb = self.embedder.embed(fact).unwrap_or_default();
                     let top_scores = self.domains.most_similar(&fact_emb);
                     let primary = top_scores.first()
                         .map(|(n, _)| n.clone())
                         .unwrap_or_else(|| "Gaia".to_string());
 
-                    // Only insert if not already known
                     if self.memory.spatial.concepts.iter()
-                        .all(|c| c.name != *fact) 
+                        .all(|c| c.name != *fact)
                     {
                         let anchor = personality_domain_anchor(&self.domains, &primary);
                         let concept = ConceptPoint::new(
@@ -279,8 +333,7 @@ impl Quorum {
                             self.memory.manifold.epoch,
                         );
                         self.memory.insert_concept(concept, &position, &primary);
-                        self.memory.spatial.consolidate_depth(fact, true, &anchor);
-                         // Multiplicative association — find related concepts
+                        self.memory.spatial.consolidate_depth(fact, true, &anchor, 0.0, 0.0);
                         let phase = crate::memory::spatial::personality_phase(&primary);
                         let related = self.memory.spatial.nearest_with_phase(&position, phase, 3);
                         if !related.is_empty() {
@@ -295,7 +348,6 @@ impl Quorum {
             }
         }
 
-        let pre_context = self.session.context();
         let pre_context = self.session.context();
         if pre_context.arc_detected {
             println!("\n[Quorum] Session arc detected. Severity={:.4}",
@@ -328,8 +380,12 @@ impl Quorum {
             }
         }
 
+        let mut last_accuracy   = 0.0f64;
+        let mut last_complexity = 0.0f64;
         if omni_score >= SEMANTIC_THRESHOLD {
             let omni_result = self.omni.speak(query, &attractor);
+            last_accuracy   = omni_result.accuracy;
+            last_complexity = omni_result.complexity;
             if let Some(response) = omni_result.response {
                 active.push(("UnifiedOmniAGI".to_string(), response));
                 active_phases.push(omni_result.phase.clone());
@@ -355,11 +411,12 @@ impl Quorum {
                 println!("\n{} personalities activated — synthesising...", active.len());
                 let mut prompt = format!("Query: {}\n\n", query);
                 for (name, resp) in &active {
-                    prompt.push_str(&format!("{} says: {}\n\n", name, resp));
+                    prompt.push_str(&format!("[{}] {}\n\n", name, resp));
                 }
-                prompt.push_str("Weave these into a single unified response.");
+                prompt.push_str("Synthesise the above into one unified response.");
+                let synth_sys = synthesis_prompt(&activated_names);
                 let synth = self.client
-                    .generate(&prompt, SYNTHESIS_PROMPT, 0.7, 200)
+                    .generate(&prompt, &synth_sys, 0.7, 200)
                     .unwrap_or_else(|e| format!("[Synthesis failed: {}]", e));
                 (
                     activated_names.iter()
@@ -423,12 +480,23 @@ impl Quorum {
             }
         }
 
-        self.brain.reinforce(query, response_approved);
+        self.brain.reinforce(query, response_approved, last_accuracy, last_complexity);
 
         println!("\n{}", "─".repeat(60));
         println!("Source: {} Phase: {}", source, best_phase);
         println!("\n{}", response);
         println!("{}", "─".repeat(60));
+
+        // Finalise provenance — response identity and governance decision
+        provenance.finalise(&response, response_approved, activated_names.clone());
+
+        // Log provenance summary
+        println!("  [UOR] query={} response={} memory_refs={} approved={}",
+            provenance.query_uor.chars().take(4).collect::<String>(),
+            provenance.response_uor.chars().take(4).collect::<String>(),
+            provenance.memory_concepts.len(),
+            provenance.governance_approved,
+        );
 
         if response_approved && !activated_names.is_empty() {
             let phase = match best_phase.as_str() {
@@ -449,7 +517,6 @@ impl Quorum {
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_string());
 
-            // Phase-matched memory display
             let query_phase = personality_phase(&primary);
             let phase_nearest = self.memory.spatial.nearest_with_phase(
                 &attractor,
@@ -482,12 +549,8 @@ impl Quorum {
             );
             self.memory.insert_concept(concept, &depth_attractor, &primary);
 
-            // Consolidate toward the personality's real domain embedding direction.
-            // This keeps Rust memories near the Gaia anchor and consciousness
-            // memories near the Khaos anchor — not collapsed to the same origin.
             let anchor = personality_domain_anchor(&self.domains, &primary);
-            self.memory.spatial.consolidate_depth(query, response_approved, &anchor);
-
+            self.memory.spatial.consolidate_depth(query, response_approved, &anchor, last_accuracy, last_complexity);
             self.memory.record_exchange(
                 query, &response, &primary, session_context.turn_count,
             );
@@ -509,12 +572,13 @@ impl Quorum {
         self.brain.save();
 
         QuorumResult {
-            query:     query.to_string(),
+            query:      query.to_string(),
             source,
             response,
-            activated: activated_names,
-            phase:     best_phase,
-            session:   session_context,
+            activated:  activated_names,
+            phase:      best_phase,
+            session:    session_context,
+            provenance,
         }
     }
 
@@ -558,6 +622,4 @@ fn fetch_kg_facts(query: &str) -> Vec<String> {
         .iter()
         .filter_map(|f| f["statement"].as_str().map(|s| s.to_string()))
         .collect()
-
 }
-

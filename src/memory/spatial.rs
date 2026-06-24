@@ -15,14 +15,29 @@
 
 use nalgebra::DVector;
 use serde::{Serialize, Deserialize};
-use crate::soul::hyperbolic::geodesic_distance;
+use crate::soul::hyperbolic::{geodesic_distance, exp_map, log_map};
 use crate::soul::INITIAL_CURVATURE;
 use std::f64::consts::PI;
 
-pub const WAVE_K:     f64 = 0.8;
-pub const SIGMA_INIT: f64 = 0.5;
-pub const SIGMA_MIN:  f64 = 0.05;
-pub const SIGMA_MAX:  f64 = 0.8;
+pub const WAVE_K:              f64 = 0.8;
+pub const SIGMA_INIT:          f64 = 0.5;
+pub const SIGMA_MIN:           f64 = 0.05;
+pub const SIGMA_MAX:           f64 = 0.8;
+pub const REPULSION_THRESHOLD: f64 = 0.05;
+pub const REPULSION_LAMBDA:    f64 = 0.02;
+
+/// Compute a UOR-compatible content address for a string.
+/// Maps each byte mod 64 to a Braille glyph (U+2800..U+283F).
+/// Same content always produces the same address on any system.
+/// Verifiable with: ''.join(chr(0x2800 + (b & 0x3F)) for b in content.encode())
+pub fn uor_address(content: &str) -> String {
+    content.bytes()
+        .map(|b| {
+            let glyph_idx = (b & 0x3F) as u32;
+            char::from_u32(0x2800 + glyph_idx).unwrap_or('?')
+        })
+        .collect()
+}
 
 /// Phase angle for each personality domain.
 pub fn personality_phase(personality: &str) -> f64 {
@@ -75,6 +90,9 @@ pub struct ConceptPoint {
     pub target_depth: f64,
     pub sigma:        f64,
     pub phase:        f64,
+    /// UOR-compatible content address — derived from concept name bytes.
+    /// Stable across any system: same content always produces the same address.
+    pub uor_address:  String,
 }
 
 impl ConceptPoint {
@@ -106,6 +124,7 @@ impl ConceptPoint {
             target_depth: 0.60 + depth_variation,
             sigma:        SIGMA_INIT,
             phase:        personality_phase(personality),
+            uor_address:  uor_address(name),
         }
     }
 
@@ -123,26 +142,26 @@ impl ConceptPoint {
     /// anchor is the personality's domain embedding projected to unit length.
     /// Concepts drift toward their personality's semantic region of the ball,
     /// not toward the shared origin — keeping domains separated after consolidation.
-    pub fn update_depth(&mut self, approved: bool, anchor: &DVector<f64>) {
-        // Precision weighting — high-certainty memories resist updating.
-        // precision = 1/σ² — normalised to 0..1 range using SIGMA_MAX.
-        // Low sigma (consolidated) → small update_rate → barely moves.
-        // High sigma (frontier)    → large update_rate → updates freely.
+    pub fn update_depth(&mut self, approved: bool, anchor: &DVector<f64>, accuracy: f64, complexity: f64) {
         let update_rate = (self.sigma / SIGMA_MAX).min(1.0);
+        let vfe_signal  = (accuracy - complexity).tanh();
 
         if approved {
-            self.target_depth = (self.target_depth * (1.0 - 0.03 * update_rate)).max(0.05);
+            let rate = 0.03 * update_rate * (1.0 + vfe_signal.max(0.0));
+            self.target_depth = (self.target_depth * (1.0 - rate)).max(0.05);
             self.sigma        = (self.sigma * (1.0 - 0.05 * update_rate)).max(SIGMA_MIN);
         } else {
-            self.target_depth = (self.target_depth * (1.0 + 0.02 * update_rate)).min(0.85);
+            let rate = 0.02 * update_rate * (1.0 + (-vfe_signal).max(0.0));
+            self.target_depth = (self.target_depth * (1.0 + rate)).min(0.85);
             self.sigma        = (self.sigma * (1.0 + 0.02 * update_rate)).min(SIGMA_MAX);
         }
         let new_pos = anchor * self.target_depth;
         self.position = new_pos.iter().cloned().collect();
         self.norm     = self.target_depth;
         self.zone     = MemoryZone::from_norm(self.norm);
-   }
+    }
 }
+
 pub struct SpatialIndex {
     pub concepts:    Vec<ConceptPoint>,
     pub soul_radius: f64,
@@ -158,7 +177,7 @@ impl SpatialIndex {
         }
     }
 
-    pub fn load(path: &str, soul_radius: f64) -> Self {
+    pub fn load(path: &str, soul_radius: f64, epoch: u32) -> Self {
         let concepts = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str::<Vec<ConceptPoint>>(&s).ok())
@@ -167,7 +186,7 @@ impl SpatialIndex {
         Self {
             concepts,
             soul_radius,
-            curvature: INITIAL_CURVATURE,
+            curvature: crate::soul::geometry::curvature_at_epoch(epoch),
         }
     }
 
@@ -176,7 +195,69 @@ impl SpatialIndex {
         Ok(())
     }
 
-    pub fn insert(&mut self, concept: ConceptPoint) {
+    /// Compute repulsion force on a position from all existing concepts.
+    /// Returns the repelled position — stays on manifold via exp_map.
+    fn apply_repulsion(&self, position: &DVector<f64>) -> DVector<f64> {
+        let mut repulsion = DVector::zeros(position.len());
+        let mut pushed    = false;
+
+        for concept in &self.concepts {
+            let neighbor = concept.position_vec();
+            let d = geodesic_distance(position, &neighbor, self.curvature);
+
+            let threshold = REPULSION_THRESHOLD;
+
+            if d < threshold && d > 1e-10 {
+                let v      = log_map(position, &neighbor, self.curvature);
+                let v_norm = v.norm().max(1e-10);
+                let v_unit = &v / v_norm;
+                let force  = REPULSION_LAMBDA * (-d / REPULSION_THRESHOLD).exp();
+                repulsion -= &v_unit * force;
+                pushed     = true;
+            }
+        }
+
+        if pushed {
+            exp_map(position, &repulsion, self.curvature)
+        } else {
+            position.clone()
+        }
+    }
+
+    /// Global repulsion pass — runs across all concept pairs.
+    pub fn repulse_all(&mut self) {
+        let positions: Vec<DVector<f64>> = self.concepts.iter()
+            .map(|c| c.position_vec())
+            .collect();
+
+        for i in 0..self.concepts.len() {
+            let mut repulsion = DVector::zeros(positions[i].len());
+            let mut pushed    = false;
+
+            for j in 0..positions.len() {
+                if i == j { continue; }
+                let d = geodesic_distance(&positions[i], &positions[j], self.curvature);
+
+                if d < REPULSION_THRESHOLD && d > 1e-10 {
+                    let v      = log_map(&positions[i], &positions[j], self.curvature);
+                    let v_norm = v.norm().max(1e-10);
+                    let v_unit = &v / v_norm;
+                    let force  = REPULSION_LAMBDA * (-d / REPULSION_THRESHOLD).exp();
+                    repulsion -= &v_unit * force;
+                    pushed     = true;
+                }
+            }
+
+            if pushed {
+                let new_pos = exp_map(&positions[i], &repulsion, self.curvature);
+                self.concepts[i].position = new_pos.iter().cloned().collect();
+                self.concepts[i].norm     = new_pos.norm();
+                self.concepts[i].zone     = MemoryZone::from_norm(self.concepts[i].norm);
+            }
+        }
+    }
+
+    pub fn insert(&mut self, mut concept: ConceptPoint) {
         if let Some(existing) = self.concepts.iter_mut()
             .find(|c| c.name == concept.name && c.personality == concept.personality)
         {
@@ -184,16 +265,23 @@ impl SpatialIndex {
             println!("  [Memory] Reinforced: {:?} (visits={} strength={:.3})",
                 existing.name, existing.visit_count, existing.strength);
         } else {
-            println!("  [Memory] New concept: {:?} zone={} norm={:.3} σ={:.3} φ={:.3}",
-                concept.name, concept.zone.label(), concept.norm,
-                concept.sigma, concept.phase);
+            let pos      = concept.position_vec();
+            let repelled = self.apply_repulsion(&pos);
+            concept.position = repelled.iter().cloned().collect();
+            concept.norm     = repelled.norm();
+            concept.zone     = MemoryZone::from_norm(concept.norm);
+
+            println!("  [Memory] New concept: {:?} uor={} zone={} norm={:.3} σ={:.3}",
+                concept.name,
+                &concept.uor_address[..concept.uor_address.len().min(12)],
+                concept.zone.label(),
+                concept.norm,
+                concept.sigma);
             self.concepts.push(concept);
         }
     }
 
     /// k nearest neighbours using complex wave packet interference score.
-    ///
-    /// score(C,q) = exp(-d²/2σ²) × cos(φ_C + k×d - φ_query) × strength
     pub fn nearest_with_phase(
         &self,
         query:       &DVector<f64>,
@@ -245,12 +333,11 @@ impl SpatialIndex {
     }
 
     /// Update depth and sigma of concept by name after governance vote.
-    /// anchor must be the personality's domain embedding unit vector.
-    pub fn consolidate_depth(&mut self, name: &str, approved: bool, anchor: &DVector<f64>) {
+    pub fn consolidate_depth(&mut self, name: &str, approved: bool, anchor: &DVector<f64>, accuracy: f64, complexity: f64) {
         if let Some(concept) = self.concepts.iter_mut().find(|c| c.name == name) {
             let old_depth = concept.target_depth;
             let old_sigma = concept.sigma;
-            concept.update_depth(approved, anchor);
+            concept.update_depth(approved, anchor, accuracy, complexity);
             println!("  [Memory] Consolidate {:?}: depth {:.4}->{:.4} σ {:.4}->{:.4} zone={}",
                 &name[..name.len().min(40)],
                 old_depth, concept.target_depth,
@@ -286,7 +373,6 @@ mod tests {
         project_to_ball(&DVector::from_vec(v))
     }
 
-    /// Simple orthogonal test anchor — idx selects which block of SOUL_DIM is positive.
     fn test_anchor(idx: usize) -> DVector<f64> {
         let dim   = SOUL_DIM;
         let block = dim / 5;
@@ -297,6 +383,28 @@ mod tests {
         }
         let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-10);
         DVector::from_vec(v.iter().map(|x| x / norm).collect())
+    }
+
+    #[test]
+    fn test_uor_address_stable() {
+        let a1 = uor_address("chaos is the foundation");
+        let a2 = uor_address("chaos is the foundation");
+        assert_eq!(a1, a2, "Same content must produce same UOR address");
+        let a3 = uor_address("different content");
+        assert_ne!(a1, a3, "Different content must produce different UOR address");
+    }
+
+    #[test]
+    fn test_uor_address_nonempty() {
+        assert!(!uor_address("hello").is_empty());
+    }
+
+    #[test]
+    fn test_concept_has_uor_address() {
+        let pos = ball_vec(1.0, SOUL_DIM);
+        let c = ConceptPoint::new("void is primordial", &pos, 1.0, "Khaos", 1.2, 1.0, 0);
+        assert!(!c.uor_address.is_empty());
+        assert_eq!(c.uor_address, uor_address("void is primordial"));
     }
 
     #[test]
@@ -344,8 +452,8 @@ mod tests {
         let anchor_khaos = test_anchor(2);
 
         for _ in 0..30 {
-            index.consolidate_depth("fix memory leak",       true, &anchor_gaia);
-            index.consolidate_depth("what is consciousness", true, &anchor_khaos);
+            index.consolidate_depth("fix memory leak",       true, &anchor_gaia,  0.0, 0.0);
+            index.consolidate_depth("what is consciousness", true, &anchor_khaos, 0.0, 0.0);
         }
 
         let rust_pos  = index.concepts[0].position_vec();
@@ -454,7 +562,7 @@ mod tests {
         let initial_depth = index.concepts[0].target_depth;
         let initial_sigma = index.concepts[0].sigma;
         let anchor = test_anchor(0);
-        index.consolidate_depth("x", true, &anchor);
+        index.consolidate_depth("x", true, &anchor, 0.0, 0.0);
         assert!(index.concepts[0].target_depth < initial_depth);
         assert!(index.concepts[0].sigma < initial_sigma);
     }
@@ -467,7 +575,7 @@ mod tests {
         c.target_depth = 0.5;
         index.concepts.push(c);
         let anchor = test_anchor(0);
-        index.consolidate_depth("x", false, &anchor);
+        index.consolidate_depth("x", false, &anchor, 0.0, 0.0);
         assert!(index.concepts[0].target_depth > 0.5);
     }
 
@@ -478,7 +586,7 @@ mod tests {
         index.insert(ConceptPoint::new("x", &pos, 1.0, "Khaos", 1.2, 1.0, 0));
         let anchor = test_anchor(0);
         for _ in 0..1000 {
-            index.consolidate_depth("x", true, &anchor);
+            index.consolidate_depth("x", true, &anchor, 0.0, 0.0);
         }
         assert!(index.concepts[0].target_depth >= 0.05);
         assert!(index.concepts[0].sigma >= SIGMA_MIN);
