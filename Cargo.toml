@@ -12,3 +12,17 @@ nalgebra = "0.32"
 anyhow = "1.0"
 tempfile = "3.8"
 tokio = { version = "1.0", features = ["full"] }
+uuid  = { version = "1", features = ["v4", "serde"] }
+redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+tonic = "0.12"
+prost = "0.13"
+dashmap      = "6"
+futures      = "0.3"
+tokio-stream = "0.1"
+tonic-web = "0.12"
+axum = { version = "0.7", features = ["ws"] }
+tower-http  = { version = "0.5", features = ["cors"] }
+uor-foundation = "0.3.0"
+
+[build-dependencies]
+tonic-build = "0.12"

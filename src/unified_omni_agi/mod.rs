@@ -108,6 +108,8 @@ impl UnifiedOmniAGI {
             cycles,
             phase:       phase.label().to_string(),
             spark_fired: spark.is_some(),
+            accuracy:    belief.accuracy,
+            complexity:  belief.complexity,
         }
     }
 
@@ -126,4 +128,6 @@ pub struct UnifiedOmniResult {
     pub cycles:      usize,
     pub phase:       String,
     pub spark_fired: bool,
+    pub accuracy:    f64,
+    pub complexity:  f64,
 }

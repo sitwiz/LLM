@@ -221,6 +221,86 @@ pub fn minimise_vfe(
 ) -> (BeliefState, Vec<VFERecord>) {
     minimise_vfe_with_curvature(soul, attractor, observation, lr, DEFAULT_CURVATURE)
 }
+/// Streaming version — calls `on_cycle` after each VFE cycle.
+/// Existing callers use minimise_vfe unchanged.
+/// The gRPC Feed handler uses this to stream cycles in real time.
+pub fn minimise_vfe_with_callback<F>(
+    soul:        &DVector<f64>,
+    attractor:   &DVector<f64>,
+    observation: &DVector<f64>,
+    lr:          f64,
+    on_cycle:    F,
+) -> (BeliefState, Vec<VFERecord>)
+where
+    F: Fn(&VFERecord),
+{
+    let mut belief  = BeliefState::new(soul);
+    let mut history = Vec::new();
+
+    let attractor   = project_to_ball(attractor);
+    let observation = project_to_ball(observation);
+    let mut sigma   = SIGMA_PRIOR;
+
+    for cycle in 0..MAX_CYCLES {
+        belief.cycle = cycle;
+
+        belief.vfe = compute_vfe(&belief.position, &attractor, &observation, DEFAULT_CURVATURE);
+
+        let (_, complexity, accuracy) = compute_vfe_components(
+            &belief.position, &attractor, &observation,
+            sigma, SIGMA_OBS, DEFAULT_CURVATURE,
+        );
+        belief.complexity = complexity;
+        belief.accuracy   = accuracy;
+
+        let sigma_post_expected = ((sigma.powi(2) * SIGMA_OBS.powi(2))
+            / (sigma.powi(2) + SIGMA_OBS.powi(2))).sqrt();
+
+        let (efe, epistemic, pragmatic) = compute_efe(
+            &belief.position, &attractor, &observation,
+            sigma, sigma_post_expected, DEFAULT_CURVATURE,
+        );
+        belief.efe             = efe;
+        belief.epistemic_value = epistemic;
+        belief.pragmatic_value = pragmatic;
+        belief.sigma           = sigma;
+
+        let nf      = compute_nf(&belief.position);
+        let pe      = prediction_error(&belief.position, &observation, DEFAULT_CURVATURE);
+        let pe_norm = pe.norm();
+
+        belief.confidence = (-belief.vfe / (VFE_EQUILIBRIUM * 20.0)).exp();
+
+        let record = VFERecord {
+            cycle,
+            vfe:             belief.vfe,
+            complexity,
+            accuracy,
+            efe,
+            epistemic_value: epistemic,
+            pragmatic_value: pragmatic,
+            confidence:      belief.confidence,
+            nf,
+            pe_norm,
+            sigma,
+        };
+
+        on_cycle(&record);
+        history.push(record);
+
+        if belief.vfe <= VFE_EQUILIBRIUM { break; }
+
+        let lr_cycle = lr * (1.0 - cycle as f64 / MAX_CYCLES as f64).max(0.1);
+        belief.position = vfe_step(
+            &belief.position, &attractor, &observation, lr_cycle, DEFAULT_CURVATURE,
+        );
+
+        let vfe_factor = (belief.vfe / (VFE_EQUILIBRIUM * 10.0)).min(1.0);
+        sigma = (sigma * (0.85 + 0.10 * vfe_factor)).max(0.01);
+    }
+
+    (belief, history)
+}
 
 pub fn minimise_vfe_with_curvature(
     soul:        &DVector<f64>,

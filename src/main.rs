@@ -12,6 +12,9 @@ mod unified_omni_agi;
 mod session;
 mod socialisation;
 mod benchmarks;
+mod game;
+mod grpc;
+mod http;
 
 use quorum::Quorum;
 use daemon::{DaemonState, dream_cycle};
@@ -24,6 +27,54 @@ use std::time::Duration;
 
 fn main() {
     let mut quorum = Quorum::new();
+
+    // Start gRPC server in background
+    let redis_grpc = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let pantheon   = grpc::server::Pantheon::new(
+        redis_grpc,
+        std::path::PathBuf::from("game_data"),
+    );
+    let svc = grpc::server::proto::pantheon_service_server::PantheonServiceServer::new(pantheon);
+
+    let rt_grpc = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt_grpc.spawn(async move {
+        tonic::transport::Server::builder()
+            .accept_http1(true)
+            .add_service(tonic_web::enable(svc))
+            .serve("0.0.0.0:50051".parse().unwrap())
+            .await
+            .unwrap();
+    });
+
+    println!("[gRPC] PantheonService listening on 0.0.0.0:50051");
+
+    // Start HTTP bridge on 8080
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+
+    let http_state = Arc::new(crate::http::AppState {
+        population: Arc::new(crate::game::population::PopulationManager::new(
+            redis::Client::open("redis://127.0.0.1/").unwrap(),
+            std::path::PathBuf::from("game_data"),
+        )),
+        mind: Arc::new(crate::game::mind::ThrongletMind::new(
+            redis::Client::open("redis://127.0.0.1/").unwrap(),
+        )),
+        broadcast: broadcast_tx,
+    });
+
+    let http_router = crate::http::router(http_state);
+    rt_grpc.spawn(async move {
+        axum::serve(
+            tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap(),
+            http_router,
+        ).await.unwrap();
+    });
+
+    println!("[HTTP] Bridge listening on 0.0.0.0:8080");
 
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
 
@@ -49,7 +100,8 @@ fn main() {
                 let o = load_soul(Path::new("unified_omni_soul.bin"))
                     .unwrap_or_else(|_| nalgebra::DVector::zeros(256));
 
-                let (_, _, _, _, _, records) = dream_cycle(&k, &g, &t, &e, &o);
+                let epoch = crate::memory::expanding::ExpandingManifold::load("manifold.json").epoch;
+                let (_, _, _, _, _, records) = dream_cycle(&k, &g, &t, &e, &o, epoch);
                 println!("[Daemon] Dream complete. {} records.", records.len());
 
                 let mut s = state_ref.lock().unwrap();
@@ -107,7 +159,7 @@ fn main() {
 
     // ── Compression benchmark ─────────────────────────────────────────────
     println!("\n[Benchmark] Running compression benchmark...");
-    let benchmark  = CompressionBenchmark::new();
+    let benchmark   = CompressionBenchmark::new();
     let session_num = quorum.memory().episodic.len() as u64;
     if let Some(result) = benchmark.run(
         &quorum.memory().spatial,

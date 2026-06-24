@@ -56,10 +56,14 @@ impl QuestionGenerator {
             specific, and genuinely curious. Output only the question — \
             no preamble, no explanation, no quotation marks.";
 
-        self.client
+        let result = self.client
             .generate(&prompt, system, 0.8, 80)
-            .unwrap_or_else(|_| "What is the nature of understanding?".to_string())
-            .trim()
-            .to_string()
+            .unwrap_or_else(|_| "What is the nature of understanding?".to_string());
+        let trimmed = result.trim().to_string();
+        if trimmed.is_empty() {
+            "What is the nature of understanding?".to_string()
+        } else {
+            trimmed
+        }
     }
 }

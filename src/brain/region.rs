@@ -35,17 +35,6 @@ impl HierarchyLevel {
     }
 }
 
-/// A single brain region with GRU processing and hierarchical PE machinery.
-///
-/// Each region participates in two passes per query:
-///
-///   1. Forward pass — process tokens, update hidden state (bottom-up).
-///   2. Top-down pass — receive prediction from level above, compute PE,
-///      update precision, apply correction, relay PE upward.
-///
-/// Precision tracks long-run prediction accuracy — regions that consistently
-/// predict well gain authority (higher precision → stronger predictions,
-/// more weight in quorum voting).
 pub struct BrainRegion {
     pub name:               String,
     pub level:              HierarchyLevel,
@@ -57,43 +46,11 @@ pub struct BrainRegion {
     pub specialty_words:    Vec<String>,
     pub call_count:         u64,
     pub total_loss:         f64,
-
-    // ── Predictive coding state ───────────────────────────────────────────
-
-    /// Top-down prediction sent to regions one level below.
-    /// Derived from this region's hidden state — what it expects lower
-    /// levels to compute. Precision-weighted: confident regions send
-    /// stronger predictions.
     pub prediction:          DVector<f64>,
-
-    /// Prediction received FROM the level above.
-    /// Cortical regions (top of hierarchy) receive zeros.
     pub received_prediction: DVector<f64>,
-
-    /// Prediction error: how much this region's actual hidden state
-    /// deviates from what the level above expected.
-    ///
-    ///   PE = hidden − received_prediction
-    ///
-    /// Large PE = surprise = useful bottom-up signal for higher levels.
-    /// Small PE = prediction was accurate = little to learn.
     pub prediction_error:    DVector<f64>,
-
-    /// Precision = 1 / σ² — reliability of this region's predictions.
-    ///
-    /// Increases when predictions were accurate (observed PE small),
-    /// decreases when surprised (observed PE large).
-    ///
-    /// High-precision regions:
-    ///   • Send stronger top-down predictions (suppress lower levels)
-    ///   • Have more weight in quorum voting
-    ///   • Resist correction from bottom-up PE (trust their model)
     pub precision:           f64,
-
-    /// Scalar PE magnitude for logging and SNR coupling.
     pub pe_magnitude:        f64,
-
-    /// Cumulative PE across all queries in this session.
     pub total_pe:            f64,
 }
 
@@ -140,17 +97,12 @@ impl BrainRegion {
 
     // ── Forward processing ────────────────────────────────────────────────
 
-    /// Process a single token, update hidden state, regenerate prediction.
     pub fn process_token(&mut self, token_id: usize) -> Vec<(usize, f64)> {
         let x = self.gru.embed(token_id);
         let (new_hidden, _, probs) = self.gru.forward(&x, &self.hidden);
-        self.hidden    = new_hidden;
+        self.hidden     = new_hidden;
         self.call_count += 1;
         self.prediction = self.generate_prediction();
-
-        let signal = probs.iter().cloned().fold(0.0f64, f64::max);
-        let noise  = probs.iter().sum::<f64>() / probs.len() as f64;
-        self.health.update(signal, noise);
 
         probs.iter().enumerate().map(|(i, p)| (i, *p)).collect()
     }
@@ -161,34 +113,15 @@ impl BrainRegion {
 
     // ── Predictive coding pass ────────────────────────────────────────────
 
-    /// Generate top-down prediction for the level below.
-    ///
-    /// The prediction is the hidden state attenuated by a precision factor.
-    /// Confident regions (high precision) send stronger predictions,
-    /// exerting more top-down influence on lower-level processing.
-    ///
-    /// Attenuation at 0.7 prevents over-suppression of lower levels,
-    /// preserving their capacity to signal genuine surprise.
     pub fn generate_prediction(&self) -> DVector<f64> {
         let confidence_scale = 0.7 * self.precision / (self.precision + 1.0);
         &self.hidden * confidence_scale
     }
 
-    /// Accept a top-down prediction from the level above.
     pub fn receive_prediction(&mut self, prediction: DVector<f64>) {
         self.received_prediction = prediction;
     }
 
-    /// Compute prediction error and return precision-weighted version.
-    ///
-    ///   PE_raw = hidden − received_prediction
-    ///   PE_weighted = precision × PE_raw
-    ///
-    /// The weighted PE is what propagates upward. High-precision regions
-    /// send louder error signals — their surprises matter more.
-    ///
-    /// Internally, pe_magnitude (the scalar norm) is updated here and
-    /// used for precision updating and logging.
     pub fn compute_prediction_error(&mut self) -> DVector<f64> {
         self.prediction_error = &self.hidden - &self.received_prediction;
         self.pe_magnitude     = self.prediction_error.norm();
@@ -197,34 +130,14 @@ impl BrainRegion {
         &self.prediction_error * self.precision
     }
 
-    /// Update precision from recent prediction accuracy.
-    ///
-    /// Precision converges to a value that reflects long-run accuracy:
-    ///   accuracy = 1 / (1 + pe_magnitude)   — in [0, 1]
-    ///   precision_target = accuracy × MAX_PRECISION
-    ///
-    /// Exponential moving average with α=0.1 keeps precision stable
-    /// while adapting over time. Clamped to [0.1, 4.0] to prevent
-    /// degenerate collapse or runaway amplification.
     pub fn update_precision(&mut self) {
         const MAX_PRECISION: f64 = 4.0;
-        let accuracy        = 1.0 / (1.0 + self.pe_magnitude);
+        let accuracy         = 1.0 / (1.0 + self.pe_magnitude);
         let target_precision = accuracy * MAX_PRECISION;
         self.precision       = (0.9 * self.precision + 0.1 * target_precision)
             .clamp(0.1, MAX_PRECISION);
     }
 
-    /// Apply precision-gated PE correction to hidden state.
-    ///
-    /// When PE is large, this region partially adjusts its hidden state
-    /// toward the received prediction — implementing the recognition model
-    /// update in active inference:
-    ///
-    ///   correction = −correction_rate / precision × PE
-    ///
-    /// The 1/precision gating means high-confidence regions resist being
-    /// corrected (they trust their hidden state more than the incoming PE),
-    /// while uncertain regions update more freely.
     pub fn apply_pe_correction(&mut self, correction_rate: f64) {
         let rate       = (correction_rate / self.precision.max(0.1)).min(0.5);
         let correction = &self.prediction_error * (-rate);
@@ -233,14 +146,6 @@ impl BrainRegion {
 
     // ── Quorum influence ─────────────────────────────────────────────────
 
-    /// Token weight incorporating hierarchical precision and PE.
-    ///
-    /// A region's influence on quorum voting is modulated by:
-    ///   • base weight from learned word_weights
-    ///   • specialty boost for domain-matched tokens
-    ///   • precision weight — accurate predictors have more authority
-    ///   • PE penalty — surprised regions lose confidence temporarily
-    ///   • health scale — depleted SNR reduces influence
     pub fn token_weight(&self, token: &str) -> f64 {
         let base = self.word_weights.get(token).copied().unwrap_or(1.0);
 
@@ -248,9 +153,7 @@ impl BrainRegion {
             .any(|w| token.to_lowercase().contains(w.as_str()))
         { 1.5 } else { 1.0 };
 
-        // Precision boost: well-calibrated regions have more say
         let precision_w  = (self.precision / 2.0).clamp(0.5, 2.0);
-        // PE penalty: regions currently surprised have less authority
         let pe_penalty   = 1.0 / (1.0 + self.pe_magnitude * 0.5);
         let health_scale = (self.health.snr / 3.154).clamp(0.1, 2.0);
 
@@ -268,10 +171,20 @@ impl BrainRegion {
         loss
     }
 
-    pub fn experience_word(&mut self, word: &str, context: &[String], positive: bool) {
-        let delta = if positive { 0.01 } else { -0.005 };
+    /// Update word weights using VFE signal.
+    /// High confidence + low VFE → stronger reinforcement.
+    /// High VFE + low confidence → weaker or negative update.
+    pub fn experience_word(&mut self, word: &str, context: &[String], positive: bool, vfe: f64, confidence: f64) {
+        // VFE signal: positive when system is converged, negative when confused
+        let vfe_signal = (confidence - vfe.min(1.0)).tanh();
+
+        // Scale delta by VFE signal — good predictions reinforce more strongly
+        let base_delta = if positive { 0.01 } else { -0.005 };
+        let delta      = base_delta * (1.0 + vfe_signal.max(0.0));
+
         let entry = self.word_weights.entry(word.to_string()).or_insert(1.0);
         *entry    = (*entry + delta).max(0.1).min(5.0);
+
         let connections = self.knowledge_graph.entry(word.to_string()).or_default();
         for ctx_word in context { connections.insert(ctx_word.clone()); }
     }
@@ -301,7 +214,7 @@ impl BrainRegion {
     }
 
     pub fn reset_hidden(&mut self) {
-        let dim              = self.hidden.len();
+        let dim                  = self.hidden.len();
         self.hidden              = GRUCell::zero_hidden();
         self.prediction          = DVector::zeros(dim);
         self.received_prediction = DVector::zeros(dim);
@@ -329,15 +242,8 @@ impl BrainRegion {
     }
 }
 
-/// All 14 brain regions with explicit hierarchy levels.
-///
-/// Cortical (4):     frontal, temporal, parietal, occipital
-/// Intermediate (3): insular, pituitary, meninges
-/// Subcortical (2):  limbic, thalamus, hypothalamus, midbrain
-/// Brainstem (1):    cerebellum, pons, medulla_oblongata
 pub fn create_all_regions() -> Vec<BrainRegion> {
     vec![
-        // ── Cortical — executive and abstract ────────────────────────────
         BrainRegion::new("frontal_lobe", HierarchyLevel::Cortical, vec![
             "plan".into(), "decide".into(), "reason".into(), "goal".into(),
             "strategy".into(), "logic".into(), "analyse".into(), "judge".into(),
@@ -354,7 +260,6 @@ pub fn create_all_regions() -> Vec<BrainRegion> {
             "pattern".into(), "visual".into(), "see".into(), "shape".into(),
             "design".into(), "structure".into(), "recognise".into(), "detect".into(),
         ]),
-        // ── Intermediate — contextual regulation ─────────────────────────
         BrainRegion::new("insular_lobe", HierarchyLevel::Intermediate, vec![
             "feel".into(), "emotion".into(), "aware".into(), "empathy".into(),
             "trust".into(), "sense".into(), "inner".into(), "intuition".into(),
@@ -367,7 +272,6 @@ pub fn create_all_regions() -> Vec<BrainRegion> {
             "protect".into(), "boundary".into(), "context".into(), "preserve".into(),
             "integrity".into(), "contain".into(), "secure".into(), "scope".into(),
         ]),
-        // ── Subcortical — integration and gating ─────────────────────────
         BrainRegion::new("limbic", HierarchyLevel::Subcortical, vec![
             "reward".into(), "fear".into(), "anger".into(), "happy".into(),
             "memory".into(), "desire".into(), "pleasure".into(), "anxiety".into(),
@@ -384,7 +288,6 @@ pub fn create_all_regions() -> Vec<BrainRegion> {
             "alert".into(), "quick".into(), "react".into(), "reward".into(),
             "surprise".into(), "novelty".into(), "fast".into(), "trigger".into(),
         ]),
-        // ── Brainstem — basic processing ─────────────────────────────────
         BrainRegion::new("cerebellum", HierarchyLevel::Brainstem, vec![
             "precise".into(), "accurate".into(), "correct".into(), "refine".into(),
             "skill".into(), "error".into(), "timing".into(), "sequence".into(),
@@ -399,4 +302,3 @@ pub fn create_all_regions() -> Vec<BrainRegion> {
         ]),
     ]
 }
-

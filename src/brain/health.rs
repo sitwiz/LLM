@@ -50,6 +50,18 @@ impl RegionHealth {
         self.snr <= SNR_PONR
     }
 
+    pub fn update_from_vfe(&mut self, vfe: f64, confidence: f64) {
+        let signal = confidence;
+        let noise  = (vfe + 0.1).max(0.1);
+        let new_snr = signal / noise;
+        self.snr = 0.95 * self.snr + 0.05 * new_snr;
+        self.history.push(self.snr);
+        if self.history.len() > 1000 {
+            self.history.remove(0);
+
+        }
+    }
+
     pub fn needs_deep_sleep(&self) -> bool {
         self.snr <= SNR_YELLOW && self.snr > SNR_PONR
     }

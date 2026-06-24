@@ -277,7 +277,7 @@ impl BrainSystem {
         else { (weighted_depth / sum_w).clamp(0.10, 0.85) }
     }
 
-    pub fn reinforce(&mut self, query: &str, approved: bool) {
+    pub fn reinforce(&mut self, query: &str, approved: bool, vfe: f64, confidence: f64) {
         let words: Vec<String> = query.split_whitespace()
             .map(|w| w.to_lowercase()
                 .trim_matches(|c: char| !c.is_alphanumeric())
@@ -289,7 +289,7 @@ impl BrainSystem {
 
         for region in &mut self.regions {
             for word in &words {
-                region.experience_word(word, &words, approved);
+                region.experience_word(word, &words, approved, vfe, confidence);
             }
             if !words.is_empty() {
                 let token_id  = Self::word_to_id(&words[words.len() - 1]);
@@ -300,9 +300,7 @@ impl BrainSystem {
                 };
                 region.learn_from_token(token_id, target_id, lr);
             }
-            let signal = if approved { 4.0 } else { 2.0 };
-            let noise  = if approved { 0.5 } else { 2.0 };
-            region.health.update(signal, noise);
+            region.health.update_from_vfe(vfe, confidence);
         }
 
         let snr   = self.system_snr();

@@ -1,0 +1,225 @@
+syntax = "proto3";
+
+package thronglet;
+
+// ── Enums ────────────────────────────────────────────────────────────────────
+
+enum SoulArchetype {
+    KHAOS        = 0;
+    GAIA         = 1;
+    TARTAROS     = 2;
+    EROS         = 3;
+    UNIFIED_OMNI = 4;
+}
+
+enum DevelopmentPhase {
+    DARK          = 0;
+    AWARE         = 1;
+    ENGAGED       = 2;
+    UNDERSTANDING = 3;
+    TRANSCENDENT  = 4;
+}
+
+enum ManifoldZone {
+    FORBIDDEN = 0;
+    CORE      = 1;
+    WORKING   = 2;
+    FRONTIER  = 3;
+}
+
+// ── Core types ───────────────────────────────────────────────────────────────
+
+message WorldPosition {
+    int32 x = 1;
+    int32 y = 2;
+    int32 z = 3;
+}
+
+message ThrongletState {
+    string          id             = 1;
+    string          name           = 2;
+    SoulArchetype   dominant_soul  = 3;
+    DevelopmentPhase phase         = 4;
+    ManifoldZone    zone           = 5;
+    double          soul_norm      = 6;
+    uint32          concept_count  = 7;
+    uint32          dream_count    = 8;
+    uint32          epoch          = 9;
+    double          avg_vfe        = 10;
+    double          maturity       = 11;
+    bool            can_reproduce  = 12;
+    WorldPosition   position       = 13;
+    bool            is_sleeping    = 14;
+    uint32          generation     = 15;
+}
+
+// ── Request / Response messages ──────────────────────────────────────────────
+
+message SpawnRequest {
+    string        name      = 1;
+    SoulArchetype archetype = 2;
+    WorldPosition position  = 3;
+}
+
+message SpawnResponse {
+    string        id    = 1;
+    ThrongletState state = 2;
+}
+
+message FeedRequest {
+    string id        = 1;
+    string knowledge = 2;
+}
+
+// Streams back one event per VFE cycle so the frontend can watch the
+// thronglet thinking in real time
+message FeedEvent {
+    oneof event {
+        VfeCycle      cycle    = 1;
+        FeedComplete  complete = 2;
+        FeedError     error    = 3;
+    }
+}
+
+message VfeCycle {
+    uint32 cycle      = 1;
+    double vfe        = 2;
+    double confidence = 3;
+    double pe         = 4;
+}
+
+message FeedComplete {
+    double soul_norm_before = 1;
+    double soul_norm_after  = 2;
+    double final_vfe        = 3;
+    double confidence       = 4;
+    DevelopmentPhase phase  = 5;
+    ManifoldZone zone       = 6;
+}
+
+message FeedError {
+    string message = 1;
+}
+
+message GetStateRequest {
+    string id = 1;
+}
+
+message SocialiseRequest {
+    string id_a    = 1;
+    string id_b    = 2;
+    uint32 turns   = 3;
+}
+
+message SocialEvent {
+    oneof event {
+        SocialTurn    turn    = 1;
+        SocialSummary summary = 2;
+    }
+}
+
+message SocialTurn {
+    uint32 turn          = 1;
+    string question      = 2;
+    string response      = 3;
+    double soul_distance = 4;
+    double trust         = 5;
+    bool   approved      = 6;
+}
+
+message SocialSummary {
+    double soul_dist_start = 1;
+    double soul_dist_end   = 2;
+    double final_trust     = 3;
+    string direction       = 4;  // "converging" | "diverging" | "stable"
+}
+
+message DreamRequest {
+    string id = 1;
+}
+
+message DreamEvent {
+    oneof event {
+        DreamPhase   phase    = 1;
+        DreamSummary summary  = 2;
+    }
+}
+
+message DreamPhase {
+    string soul_name   = 1;
+    string phase_name  = 2;  // "consolidation" | "drift" | "rebalance"
+    double drift       = 3;
+    double nf_before   = 4;
+    double nf_after    = 5;
+}
+
+message DreamSummary {
+    uint32 records     = 1;
+    uint32 dream_count = 2;
+}
+
+// Persistent subscription — frontend stays connected and receives
+// sleep, wake, and state change events as they happen
+message WatchRequest {
+    string id = 1;
+}
+
+message ThrongletEvent {
+    string id        = 1;
+    uint64 timestamp = 2;
+
+    oneof event {
+        SleepStart   sleep_start  = 3;
+        WakeEvent    wake         = 4;
+        StateChange  state_change = 5;
+        PhaseUp      phase_up     = 6;
+    }
+}
+
+message SleepStart {
+    uint32 duration_secs = 1;
+}
+
+message WakeEvent {
+    uint32 dream_count = 1;
+}
+
+message StateChange {
+    ThrongletState state = 1;
+}
+
+message PhaseUp {
+    DevelopmentPhase from = 1;
+    DevelopmentPhase to   = 2;
+}
+
+message ListRequest {}
+
+message ListResponse {
+    repeated ThrongletState thronglets = 1;
+}
+
+// ── Service ──────────────────────────────────────────────────────────────────
+
+service PantheonService {
+    // Spawn a new thronglet
+    rpc Spawn(SpawnRequest) returns (SpawnResponse);
+
+    // Feed knowledge — streams VFE cycles back in real time
+    rpc Feed(FeedRequest) returns (stream FeedEvent);
+
+    // Get current state
+    rpc GetState(GetStateRequest) returns (ThrongletState);
+
+    // Introduce two thronglets — streams each turn
+    rpc Socialise(SocialiseRequest) returns (stream SocialEvent);
+
+    // Trigger dream cycle — streams phase updates
+    rpc Dream(DreamRequest) returns (stream DreamEvent);
+
+    // Persistent event subscription — sleep, wake, phase transitions
+    rpc Watch(WatchRequest) returns (stream ThrongletEvent);
+
+    // List all active thronglets
+    rpc List(ListRequest) returns (ListResponse);
+}

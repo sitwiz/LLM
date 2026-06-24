@@ -130,7 +130,8 @@ impl SocialisedSession {
                 } else {
                     result_b.response.clone()
                 };
-                instance_a.reflect_silent(&reflection_text);
+                let influence = 0.3 * self.trust.a_trusts_b;
+                instance_a.reflect_silent(&reflection_text, influence);
                 self.trust.update_b_trusts_a(vfe_drop, true);
             }
             // Measure omni soul distance after exchange

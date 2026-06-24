@@ -44,7 +44,7 @@ pub struct MemorySystem {
 impl MemorySystem {
     pub fn new() -> Self {
         let manifold = ExpandingManifold::load("manifold_state.json");
-        let spatial  = SpatialIndex::load("memory_index.json", manifold.radius);
+        let spatial  = SpatialIndex::load("memory_index.json", manifold.radius, manifold.epoch);
         let pointer  = PointerIndex::load(Path::new("pointer_index.json"));
         let episodic = EpisodicMemory::load("episodic_memory.jsonl");
 
@@ -161,7 +161,8 @@ impl MemorySystem {
     }
 
     /// Save all persistent layers to disk.
-    pub fn save(&self) {
+    pub fn save(&mut self) {
+        self.spatial.repulse_all();
         self.spatial.save("memory_index.json").ok();
         self.manifold.save("manifold_state.json").ok();
         self.pointer.save(Path::new("pointer_index.json")).ok();
